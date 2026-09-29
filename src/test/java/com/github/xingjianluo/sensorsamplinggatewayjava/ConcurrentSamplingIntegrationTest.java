@@ -109,15 +109,15 @@ class ConcurrentSamplingIntegrationTest {
 
         GatewayStats s = gw.stats();
         assertNoDuplicateKeys(gw.verdictLog().recent());
-        // 容量为1 + DROP_OLDEST + 两个高速生产者：应观测到驱逐
+        // 容量为1 + DROP_OLDEST + 高速生产者：应观测到驱逐
         assertTrue(s.dropped() > 0, "expected DROP_OLDEST evictions under pressure");
         long overflowCount = s.rejectedByReason().getOrDefault(RejectReason.BUFFER_OVERFLOW, 0L);
-        // 驱逐只计 dropped（不重复进 rejectedTotal）；此处 DROP_OLDEST 成功路径无 rejected newest
-        assertEquals(s.dropped(), s.dropped(), "dropped counter stable");
-        assertTrue(overflowCount >= 0L);
-        // 不变量：submitted = enqueued + rejectedTotal
-        assertEquals(s.submitted(), s.enqueued() + s.rejected(),
-                "submitted must equal enqueued + rejected");
+        assertTrue(overflowCount > 0, "evicted oldest form BUFFER_OVERFLOW verdicts");
+        // 正确不变量（每个 sensor#tick 恰一条结论）：submitted = accepted + rejected，
+        // 且背压 dropped = byReason[BUFFER_OVERFLOW]（驱逐 + 直接拒绝）
+        assertEquals(s.submitted(), s.accepted() + s.rejected(),
+                "submitted must equal accepted + rejected");
+        assertEquals(s.dropped(), overflowCount, "dropped equals BUFFER_OVERFLOW rejections");
         logSummary("DROP_OLDEST", gw);
     }
 

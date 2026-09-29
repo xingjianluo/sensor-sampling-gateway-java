@@ -9,6 +9,8 @@ import com.github.xingjianluo.sensorsamplinggatewayjava.model.SensorConfig;
 import com.github.xingjianluo.sensorsamplinggatewayjava.model.Verdict;
 import com.github.xingjianluo.sensorsamplinggatewayjava.pipeline.ReadingValidator;
 import com.github.xingjianluo.sensorsamplinggatewayjava.pipeline.VerdictLog;
+import com.github.xingjianluo.sensorsamplinggatewayjava.reconcile.BackpressureKind;
+import com.github.xingjianluo.sensorsamplinggatewayjava.reconcile.ReconciliationStore;
 import com.github.xingjianluo.sensorsamplinggatewayjava.reliability.CircuitBreaker;
 import com.github.xingjianluo.sensorsamplinggatewayjava.reliability.RetryPolicy;
 import com.github.xingjianluo.sensorsamplinggatewayjava.reliability.Sleeper;
@@ -51,6 +53,7 @@ public final class SamplingGateway {
     private final StatsCollector stats;
     private volatile VerdictLog verdictLog;
     private final ReadingValidator validator;
+    private final ReconciliationStore reconciliation;
 
     private BoundedBuffer buffer;
     private final Map<String, CircuitBreaker> breakers = new ConcurrentHashMap<>();
@@ -88,6 +91,10 @@ public final class SamplingGateway {
         this.stats = stats;
         this.verdictLog = new VerdictLog(config.verdictLogCapacity());
         this.validator = new ReadingValidator(clock);
+        this.reconciliation = new ReconciliationStore(
+                config.reconcileDetailCapacity(),
+                config.reconcileMaxSealedGenerations(),
+                config.reconcileRetentionPolicy());
         this.buffer = new BoundedBuffer(config.bufferCapacity(), config.overflowPolicy());
         for (SensorConfig sc : config.sensors()) {
             breakers.put(sc.getId(),
@@ -101,6 +108,7 @@ public final class SamplingGateway {
         }
         running.set(true);
         stopRequested.set(false);
+        reconciliation.beginGeneration(config.rulesVersion(), clock.nowMillis());
         bufferPoolsUp();
         LOG.info(() -> "SamplingGateway started: rulesVersion=" + config.rulesVersion()
                 + ", buffer=" + config.bufferCapacity() + "/" + config.overflowPolicy()
@@ -245,17 +253,21 @@ public final class SamplingGateway {
                     "input{sensor=" + r.sensorId() + ",tick=" + r.tick()
                             + "}; rule=buffer(capacity=" + buffer.capacity() + ",policy=" + result.policy()
                             + ") rejected newest on full/closed -> BUFFER_OVERFLOW",
-                    config.rulesVersion()));
+                    config.rulesVersion()), BackpressureKind.REJECTED_NEW);
         }
         if (result.evictedReading() != null) {
             // DROP_OLDEST：新读数已入队（已计 enqueued），被驱逐的旧读数单独形成一条可区分结论
             RawReading ev = result.evictedReading();
-            stats.droppedEviction();
+            // 被顶掉的旧读数同样是一次拒绝落账：统一走 rejected(BUFFER_OVERFLOW)，
+            // 它同时使 dropped+1。最终 dropped = evicted + rejectedNew
+            // = byReason[BUFFER_OVERFLOW]，且 submitted = accepted + rejected 严格成立，
+            // 与对账台账（evictedOld / rejectedNew 分列）口径一致。
+            stats.rejected(RejectReason.BUFFER_OVERFLOW);
             record(Verdict.reject(ev, RejectReason.BUFFER_OVERFLOW,
                     "input{sensor=" + ev.sensorId() + ",tick=" + ev.tick()
                             + "}; rule=buffer(capacity=" + buffer.capacity()
                             + ",policy=DROP_OLDEST) evicted oldest to make room -> BUFFER_OVERFLOW",
-                    config.rulesVersion()));
+                    config.rulesVersion()), BackpressureKind.EVICTED_OLD);
         }
     }
 
@@ -298,7 +310,12 @@ public final class SamplingGateway {
     }
 
     private void record(Verdict verdict) {
+        record(verdict, BackpressureKind.NONE);
+    }
+
+    private void record(Verdict verdict, BackpressureKind backpressure) {
         verdictLog.append(verdict);
+        reconciliation.append(verdict, backpressure, clock.nowMillis());
         LOG.info(() -> "VERDICT " + (verdict.accepted() ? "ACCEPT" : "REJECT:" + verdict.reason())
                 + " " + verdict.basis() + " [rules=" + verdict.rulesVersion() + "]");
     }
@@ -326,9 +343,13 @@ public final class SamplingGateway {
             Thread.currentThread().interrupt();
             LOG.warning("interrupted while draining enqueued readings");
         }
-        // 3) 关闭线程池
+        // 3) 关闭线程池（此后不再有新裁决产生；优雅关闭要求排空在超时内完成，
+        //    正常路径缓冲必为 0，见 LifecycleRestartTest）
         shutdownPool(consumerPool);
         shutdownPool(producerPool);
+        // 4) 封代：冻结本批次账目。已入队但排空超时仍滞留的读数不产生裁决，
+        //    会在对账中表现为缺口并触发闭合校验，属于需调大 shutdownDrainTimeoutMs 的告警情形。
+        reconciliation.sealGeneration(clock.nowMillis());
         LOG.info("SamplingGateway stopped");
     }
 
@@ -372,6 +393,7 @@ public final class SamplingGateway {
         this.verdictLog = new VerdictLog(newConfig.verdictLogCapacity());
         stopRequested.set(false);
         running.set(true);
+        reconciliation.beginGeneration(newConfig.rulesVersion(), clock.nowMillis());
         bufferPoolsUp();
         LOG.info(() -> "SamplingGateway restarted with rulesVersion=" + newConfig.rulesVersion());
     }
@@ -414,6 +436,10 @@ public final class SamplingGateway {
 
     public VerdictLog verdictLog() {
         return verdictLog;
+    }
+
+    public ReconciliationStore reconciliation() {
+        return reconciliation;
     }
 
     public GatewayConfig config() {

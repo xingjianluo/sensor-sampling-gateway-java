@@ -14,11 +14,12 @@ import java.util.concurrent.atomic.AtomicLong;
  * <p>每个采样尝试（一个 {@code sensor#tick}）恰好终结于一次计数，不变量：</p>
  * <ul>
  *   <li>{@code submitted = enqueued + rejectedTotal}
- *       （隔离/采集失败/缓冲拒绝都计 submitted 且计对应 rejected 原因）；</li>
+ *       （隔离/采集失败/缓冲拒绝/驱逐都计 submitted 且计对应 rejected 原因）；</li>
  *   <li>消费侧 {@code consumed = accepted + (DATA_CORRUPT|TIMESTAMP_ANOMALY|OUT_OF_RANGE)}；</li>
  *   <li>{@code enqueued = consumed + droppedOldest}（DROP_OLDEST 驱逐发生在消费前）；</li>
- *   <li>{@code dropped = DROP_OLDEST 驱逐数 + DROP_NEWEST(及关闭期BLOCK) 拒绝数}，
- *       即 {@code byReason[BUFFER_OVERFLOW] + droppedOldest}。驱逐不重复计入 rejectedTotal。</li>
+ *   <li>{@code dropped = DROP_OLDEST 驱逐数 + DROP_NEWEST(及关闭期BLOCK) 拒绝数
+ *       = byReason[BUFFER_OVERFLOW]}；驱逐与直接拒绝都计入 rejectedTotal，
+ *       因而 {@code submitted = accepted + rejectedTotal} 严格成立，与对账台账互证。</li>
  * </ul>
  */
 public final class StatsCollector {
@@ -58,13 +59,9 @@ public final class StatsCollector {
         rejectedTotal.incrementAndGet();
         byReason.get(reason).incrementAndGet();
         if (reason == RejectReason.BUFFER_OVERFLOW) {
+            // 同时覆盖 DROP_NEWEST 直接拒绝与 DROP_OLDEST 驱逐两种背压
             dropped.incrementAndGet();
         }
-    }
-
-    /** 记录 DROP_OLDEST 的驱逐：被驱逐的读数同样形成可区分的 BUFFER_OVERFLOW 结论。 */
-    public void droppedEviction() {
-        dropped.incrementAndGet();
     }
 
     public void acquisitionFailure() {

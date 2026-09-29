@@ -33,6 +33,9 @@ public class GatewayProperties {
     private long breakerCooldownMs = 2000;
     private long shutdownDrainTimeoutMs = 5000;
     private int verdictLogCapacity = 1024;
+    private int reconcileDetailCapacity = 4096;
+    private int reconcileMaxSealedGenerations = 8;
+    private String reconcileRetentionPolicy = "ROLL_OLDEST";
     private List<SensorProps> sensors = new ArrayList<>();
 
     /** 转换为不可变快照（含每传感器校准模型）。 */
@@ -57,7 +60,10 @@ public class GatewayProperties {
         return new GatewayConfig(rulesVersion, configs, model,
                 bufferCapacity, OverflowPolicy.valueOf(overflowPolicy.trim().toUpperCase()),
                 consumerThreads, retry, breakerThreshold, breakerCooldownMs,
-                shutdownDrainTimeoutMs, verdictLogCapacity);
+                shutdownDrainTimeoutMs, verdictLogCapacity,
+                reconcileDetailCapacity, reconcileMaxSealedGenerations,
+                com.github.xingjianluo.sensorsamplinggatewayjava.reconcile.RetentionPolicy
+                        .valueOf(reconcileRetentionPolicy.trim().toUpperCase()));
     }
 
     public static class SensorProps {
@@ -117,6 +123,12 @@ public class GatewayProperties {
     public void setShutdownDrainTimeoutMs(long v) { this.shutdownDrainTimeoutMs = v; }
     public int getVerdictLogCapacity() { return verdictLogCapacity; }
     public void setVerdictLogCapacity(int v) { this.verdictLogCapacity = v; }
+    public int getReconcileDetailCapacity() { return reconcileDetailCapacity; }
+    public void setReconcileDetailCapacity(int v) { this.reconcileDetailCapacity = v; }
+    public int getReconcileMaxSealedGenerations() { return reconcileMaxSealedGenerations; }
+    public void setReconcileMaxSealedGenerations(int v) { this.reconcileMaxSealedGenerations = v; }
+    public String getReconcileRetentionPolicy() { return reconcileRetentionPolicy; }
+    public void setReconcileRetentionPolicy(String v) { this.reconcileRetentionPolicy = v; }
     public List<SensorProps> getSensors() { return sensors; }
     public void setSensors(List<SensorProps> sensors) { this.sensors = sensors; }
 }

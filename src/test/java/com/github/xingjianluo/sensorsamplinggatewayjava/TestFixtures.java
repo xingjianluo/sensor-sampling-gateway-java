@@ -37,11 +37,24 @@ final class TestFixtures {
                                        int consumers,
                                        int retryAttempts,
                                        int breakerThreshold) {
+        return gatewayConfig(rulesVersion, sensorConfigs, bufferCapacity, policy, consumers,
+                retryAttempts, breakerThreshold, 1_000_000L);
+    }
+
+    /** 可指定断路器冷却：配合会推进手动时钟的睡眠器，可确定性地驱动 OPEN→HALF_OPEN 探测。 */
+    static GatewayConfig gatewayConfig(String rulesVersion,
+                                       List<SensorConfig> sensorConfigs,
+                                       int bufferCapacity,
+                                       OverflowPolicy policy,
+                                       int consumers,
+                                       int retryAttempts,
+                                       int breakerThreshold,
+                                       long breakerCooldownMs) {
         RetryPolicy retry = new RetryPolicy(retryAttempts, 1L, 2.0, 50L, 0.0);
         CalibrationModel calib = CalibrationModel.identity(rulesVersion + "-calib");
         return new GatewayConfig(rulesVersion, sensorConfigs, calib,
                 bufferCapacity, policy, consumers, retry,
-                breakerThreshold, 1_000_000L, 5000L, 4096);
+                breakerThreshold, breakerCooldownMs, 5000L, 4096);
     }
 
     /** 构建脚本传感器：每次 period 睡眠都把手动时钟向前推进，读数时间戳因此确定。 */
@@ -76,17 +89,15 @@ final class TestFixtures {
     }
 
     /**
-     * 为每个传感器包一层“硬采样上限”：第 {@code limit} 次之后抛出
-     * 非恢复性 {@link SensorFaultException}，使采样拍数在源头确定，
-     * 不依赖停止信号与线程调度的竞争（杜绝关闭边界多拍/少拍）。
+     * 为每个传感器包一层“硬采样上限”：当拍号 {@code tick >= limit} 时抛出
+     * 非故障的 {@link SamplingLimitReached}，使采样拍数在源头精确确定。
+     * 按 tick（而非调用次数）判定，因此有界重试不会提前耗光配额、不会跨 tick 漏拍。
      */
     static Map<String, Sensor> limited(Map<String, Sensor> sensors, Map<String, Integer> limits) {
         Map<String, Sensor> out = new LinkedHashMap<>();
         for (Map.Entry<String, Sensor> e : sensors.entrySet()) {
             Sensor delegate = e.getValue();
             int limit = limits.getOrDefault(e.getKey(), Integer.MAX_VALUE);
-            java.util.concurrent.atomic.AtomicInteger count =
-                    new java.util.concurrent.atomic.AtomicInteger();
             out.put(e.getKey(), new Sensor() {
                 @Override
                 public SensorConfig config() {
@@ -95,7 +106,7 @@ final class TestFixtures {
 
                 @Override
                 public RawReading sample(long tick) throws Exception {
-                    if (count.getAndIncrement() >= limit) {
+                    if (tick >= limit) {
                         // 协作式停止：不是故障，不产生裁决
                         throw new SamplingLimitReached(config().getId(), tick);
                     }
