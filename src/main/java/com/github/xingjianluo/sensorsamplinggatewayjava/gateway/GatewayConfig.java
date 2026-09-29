@@ -23,7 +23,42 @@ public record GatewayConfig(String rulesVersion,
                             int breakerThreshold,
                             long breakerCooldownMs,
                             long shutdownDrainTimeoutMs,
-                            int verdictLogCapacity) {
+                            int verdictLogCapacity,
+                            int reconcileDetailCapacity,
+                            long maxTicksPerSensor) {
+
+    public GatewayConfig(String rulesVersion,
+                         List<SensorConfig> sensors,
+                         CalibrationModel calibration,
+                         int bufferCapacity,
+                         OverflowPolicy overflowPolicy,
+                         int consumerThreads,
+                         RetryPolicy retryPolicy,
+                         int breakerThreshold,
+                         long breakerCooldownMs,
+                         long shutdownDrainTimeoutMs,
+                         int verdictLogCapacity) {
+        this(rulesVersion, sensors, calibration, bufferCapacity, overflowPolicy, consumerThreads,
+                retryPolicy, breakerThreshold, breakerCooldownMs, shutdownDrainTimeoutMs,
+                verdictLogCapacity, Math.max(1, verdictLogCapacity), 0L);
+    }
+
+    public GatewayConfig(String rulesVersion,
+                         List<SensorConfig> sensors,
+                         CalibrationModel calibration,
+                         int bufferCapacity,
+                         OverflowPolicy overflowPolicy,
+                         int consumerThreads,
+                         RetryPolicy retryPolicy,
+                         int breakerThreshold,
+                         long breakerCooldownMs,
+                         long shutdownDrainTimeoutMs,
+                         int verdictLogCapacity,
+                         int reconcileDetailCapacity) {
+        this(rulesVersion, sensors, calibration, bufferCapacity, overflowPolicy, consumerThreads,
+                retryPolicy, breakerThreshold, breakerCooldownMs, shutdownDrainTimeoutMs,
+                verdictLogCapacity, reconcileDetailCapacity, 0L);
+    }
 
     public GatewayConfig {
         sensors = List.copyOf(sensors);
@@ -35,6 +70,12 @@ public record GatewayConfig(String rulesVersion,
         }
         if (bufferCapacity < 1) {
             throw new IllegalArgumentException("bufferCapacity must be >= 1");
+        }
+        if (reconcileDetailCapacity < 1) {
+            throw new IllegalArgumentException("reconcileDetailCapacity must be >= 1");
+        }
+        if (maxTicksPerSensor < 0) {
+            throw new IllegalArgumentException("maxTicksPerSensor must be >= 0 (0 = unlimited)");
         }
     }
 

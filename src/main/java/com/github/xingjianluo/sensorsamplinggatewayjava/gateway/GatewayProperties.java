@@ -33,6 +33,8 @@ public class GatewayProperties {
     private long breakerCooldownMs = 2000;
     private long shutdownDrainTimeoutMs = 5000;
     private int verdictLogCapacity = 1024;
+    /** 对账明细保留条数（FIFO 有界窗口）；精确聚合计数不受此值影响。 */
+    private int reconcileDetailCapacity = 100_000;
     private List<SensorProps> sensors = new ArrayList<>();
 
     /** 转换为不可变快照（含每传感器校准模型）。 */
@@ -57,7 +59,7 @@ public class GatewayProperties {
         return new GatewayConfig(rulesVersion, configs, model,
                 bufferCapacity, OverflowPolicy.valueOf(overflowPolicy.trim().toUpperCase()),
                 consumerThreads, retry, breakerThreshold, breakerCooldownMs,
-                shutdownDrainTimeoutMs, verdictLogCapacity);
+                shutdownDrainTimeoutMs, verdictLogCapacity, reconcileDetailCapacity);
     }
 
     public static class SensorProps {
@@ -117,6 +119,8 @@ public class GatewayProperties {
     public void setShutdownDrainTimeoutMs(long v) { this.shutdownDrainTimeoutMs = v; }
     public int getVerdictLogCapacity() { return verdictLogCapacity; }
     public void setVerdictLogCapacity(int v) { this.verdictLogCapacity = v; }
+    public int getReconcileDetailCapacity() { return reconcileDetailCapacity; }
+    public void setReconcileDetailCapacity(int v) { this.reconcileDetailCapacity = v; }
     public List<SensorProps> getSensors() { return sensors; }
     public void setSensors(List<SensorProps> sensors) { this.sensors = sensors; }
 }

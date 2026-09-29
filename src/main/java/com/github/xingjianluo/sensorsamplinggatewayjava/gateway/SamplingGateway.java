@@ -9,6 +9,8 @@ import com.github.xingjianluo.sensorsamplinggatewayjava.model.SensorConfig;
 import com.github.xingjianluo.sensorsamplinggatewayjava.model.Verdict;
 import com.github.xingjianluo.sensorsamplinggatewayjava.pipeline.ReadingValidator;
 import com.github.xingjianluo.sensorsamplinggatewayjava.pipeline.VerdictLog;
+import com.github.xingjianluo.sensorsamplinggatewayjava.reconcile.ReconcileEntry;
+import com.github.xingjianluo.sensorsamplinggatewayjava.reconcile.ReconcileLedger;
 import com.github.xingjianluo.sensorsamplinggatewayjava.reliability.CircuitBreaker;
 import com.github.xingjianluo.sensorsamplinggatewayjava.reliability.RetryPolicy;
 import com.github.xingjianluo.sensorsamplinggatewayjava.reliability.Sleeper;
@@ -50,6 +52,7 @@ public final class SamplingGateway {
     private final java.util.function.Function<GatewayConfig, Map<String, Sensor>> sensorFactory;
     private final StatsCollector stats;
     private volatile VerdictLog verdictLog;
+    private final ReconcileLedger reconcileLedger;
     private final ReadingValidator validator;
 
     private BoundedBuffer buffer;
@@ -87,6 +90,7 @@ public final class SamplingGateway {
         this.sleeper = sleeper;
         this.stats = stats;
         this.verdictLog = new VerdictLog(config.verdictLogCapacity());
+        this.reconcileLedger = new ReconcileLedger(config.reconcileDetailCapacity());
         this.validator = new ReadingValidator(clock);
         this.buffer = new BoundedBuffer(config.bufferCapacity(), config.overflowPolicy());
         for (SensorConfig sc : config.sensors()) {
@@ -101,6 +105,7 @@ public final class SamplingGateway {
         }
         running.set(true);
         stopRequested.set(false);
+        reconcileLedger.beginRun(clock.nowMillis());
         bufferPoolsUp();
         LOG.info(() -> "SamplingGateway started: rulesVersion=" + config.rulesVersion()
                 + ", buffer=" + config.bufferCapacity() + "/" + config.overflowPolicy()
@@ -143,6 +148,12 @@ public final class SamplingGateway {
         CircuitBreaker breaker = breakers.get(id);
         while (running.get() && !stopRequested.get()) {
             long t = tick.getAndIncrement();
+            long budget = config.maxTicksPerSensor();
+            if (budget > 0 && t >= budget) {
+                // 网关级拍数预算：在断路器/采样之前生效，隔离拍同样受限，使一次运行边界确定。
+                LOG.fine(() -> "producer for " + id + " reached tick budget " + budget);
+                return;
+            }
             try {
                 if (!breaker.allowRequest(clock.nowMillis())) {
                     stats.submitted();
@@ -255,7 +266,7 @@ public final class SamplingGateway {
                     "input{sensor=" + ev.sensorId() + ",tick=" + ev.tick()
                             + "}; rule=buffer(capacity=" + buffer.capacity()
                             + ",policy=DROP_OLDEST) evicted oldest to make room -> BUFFER_OVERFLOW",
-                    config.rulesVersion()));
+                    config.rulesVersion()), true);
         }
     }
 
@@ -298,7 +309,13 @@ public final class SamplingGateway {
     }
 
     private void record(Verdict verdict) {
+        record(verdict, false);
+    }
+
+    private void record(Verdict verdict, boolean evicted) {
         verdictLog.append(verdict);
+        reconcileLedger.append(new ReconcileEntry(
+                reconcileLedger.currentRunId(), clock.nowMillis(), verdict, evicted));
         LOG.info(() -> "VERDICT " + (verdict.accepted() ? "ACCEPT" : "REJECT:" + verdict.reason())
                 + " " + verdict.basis() + " [rules=" + verdict.rulesVersion() + "]");
     }
@@ -329,6 +346,8 @@ public final class SamplingGateway {
         // 3) 关闭线程池
         shutdownPool(consumerPool);
         shutdownPool(producerPool);
+        // 4) 封口对账运行：计数与明细不再变动，旧运行可永久回溯
+        reconcileLedger.sealRun(clock.nowMillis());
         LOG.info("SamplingGateway stopped");
     }
 
@@ -372,6 +391,7 @@ public final class SamplingGateway {
         this.verdictLog = new VerdictLog(newConfig.verdictLogCapacity());
         stopRequested.set(false);
         running.set(true);
+        reconcileLedger.beginRun(clock.nowMillis());
         bufferPoolsUp();
         LOG.info(() -> "SamplingGateway restarted with rulesVersion=" + newConfig.rulesVersion());
     }
@@ -379,6 +399,21 @@ public final class SamplingGateway {
     private void reinitBuffer(GatewayConfig cfg) {
         // field reassigned only while stopped
         this.buffer = new BoundedBuffer(cfg.bufferCapacity(), cfg.overflowPolicy());
+    }
+
+    /**
+     * 运行中热切换规则版本（同一运行代次内）：整体替换配置快照，随后新产生的裁决都携带
+     * 新规则版本；缓冲、断路器状态与线程不重置，已入队读数继续排空。
+     * 同一 {@code sensor#tick} 仍只有一条裁决，因此旧/新版本账目以裁决上的
+     * rulesVersion 自然分界，互不重叠。
+     */
+    public synchronized void switchRulesVersion(GatewayConfig newConfig) {
+        if (!running.get()) {
+            throw new IllegalStateException("gateway is not running; use restart() instead");
+        }
+        this.config = newConfig;
+        LOG.info(() -> "rules version switched at run " + reconcileLedger.currentRunId()
+                + ": " + newConfig.rulesVersion());
     }
 
     /** 请求生产者停止节拍（不关闭缓冲）。测试用于精确控制采样拍数。 */
@@ -414,6 +449,10 @@ public final class SamplingGateway {
 
     public VerdictLog verdictLog() {
         return verdictLog;
+    }
+
+    public ReconcileLedger reconcileLedger() {
+        return reconcileLedger;
     }
 
     public GatewayConfig config() {

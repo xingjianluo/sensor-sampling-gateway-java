@@ -44,6 +44,40 @@ final class TestFixtures {
                 breakerThreshold, 1_000_000L, 5000L, 4096);
     }
 
+    /** 额外指定对账明细保留窗口容量（验证保留边界用）。 */
+    static GatewayConfig gatewayConfig(String rulesVersion,
+                                       List<SensorConfig> sensorConfigs,
+                                       int bufferCapacity,
+                                       OverflowPolicy policy,
+                                       int consumers,
+                                       int retryAttempts,
+                                       int breakerThreshold,
+                                       int reconcileDetailCapacity) {
+        GatewayConfig base = gatewayConfig(rulesVersion, sensorConfigs, bufferCapacity,
+                policy, consumers, retryAttempts, breakerThreshold);
+        return new GatewayConfig(rulesVersion, sensorConfigs, base.calibration(),
+                bufferCapacity, policy, consumers, base.retryPolicy(), breakerThreshold,
+                1_000_000L, 5000L, base.verdictLogCapacity(), reconcileDetailCapacity);
+    }
+
+    /** 指定对账明细窗口容量与每传感器拍数预算（确定性运行边界用）。 */
+    static GatewayConfig gatewayConfig(String rulesVersion,
+                                       List<SensorConfig> sensorConfigs,
+                                       int bufferCapacity,
+                                       OverflowPolicy policy,
+                                       int consumers,
+                                       int retryAttempts,
+                                       int breakerThreshold,
+                                       int reconcileDetailCapacity,
+                                       long maxTicksPerSensor) {
+        GatewayConfig base = gatewayConfig(rulesVersion, sensorConfigs, bufferCapacity,
+                policy, consumers, retryAttempts, breakerThreshold);
+        return new GatewayConfig(rulesVersion, sensorConfigs, base.calibration(),
+                bufferCapacity, policy, consumers, base.retryPolicy(), breakerThreshold,
+                1_000_000L, 5000L, base.verdictLogCapacity(),
+                reconcileDetailCapacity, maxTicksPerSensor);
+    }
+
     /** 构建脚本传感器：每次 period 睡眠都把手动时钟向前推进，读数时间戳因此确定。 */
     static Map<String, Sensor> scriptedSensors(ManualClock clock,
                                                Map<String, SensorConfig> cfgs,
