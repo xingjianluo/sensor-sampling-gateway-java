@@ -154,6 +154,23 @@ public final class BoundedBuffer {
         }
     }
 
+    /**
+     * 排空超时后的兜底：取出并移除当前仍滞留在队列中的全部读数（最旧在前）。
+     * 调用方据此把每条滞留读数明确落为 SHUTDOWN_INCOMPLETE，做到不漏账。
+     * 与 {@link #poll()} 互斥：一条读数要么已被消费者取走处理，要么留在本列表中，不重不漏。
+     */
+    public java.util.List<RawReading> drainAll() {
+        lock.lock();
+        try {
+            java.util.List<RawReading> rest = new java.util.ArrayList<>(deque);
+            deque.clear();
+            notFull.signalAll();
+            return rest;
+        } finally {
+            lock.unlock();
+        }
+    }
+
     public int capacity() {
         return capacity;
     }

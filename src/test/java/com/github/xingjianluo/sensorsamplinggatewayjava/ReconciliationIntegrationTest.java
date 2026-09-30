@@ -50,11 +50,15 @@ class ReconciliationIntegrationTest {
     }
 
     private static void assertReportClosed(ReconciliationReport r) {
-        assertEquals(r.total(), r.accepted() + r.rejected());
+        // 历史口径：被顶掉（evictedOld）单列，不计入 rejected
+        assertEquals(r.total(), r.accepted() + r.rejected() + r.evictedOld());
         long byReason = r.rejectedByReason().values().stream().mapToLong(Long::longValue).sum();
         assertEquals(r.rejected(), byReason);
         long overflow = r.rejectedByReason().getOrDefault(RejectReason.BUFFER_OVERFLOW, 0L);
-        assertEquals(r.evictedOld() + r.rejectedNew(), overflow);
+        assertEquals(r.rejectedNew(), overflow,
+                "legacy BUFFER_OVERFLOW bucket counts only directly-rejected newest");
+        long unfinished = r.rejectedByReason().getOrDefault(RejectReason.SHUTDOWN_INCOMPLETE, 0L);
+        assertEquals(r.unfinished(), unfinished);
         Set<String> keys = new HashSet<>();
         for (ReconciliationEntry e : r.acceptedEntries()) {
             assertTrue(e.accepted());
@@ -70,14 +74,19 @@ class ReconciliationIntegrationTest {
     /** 与 StatsCollector 互证：台账聚合必须等于网关统一计数（在明细未滚动时含明细数）。 */
     private static void assertMatchesStats(ReconciliationReport r, GatewayStats s) {
         assertEquals(s.accepted(), r.accepted(), "accepted matches stats");
-        assertEquals(s.rejected(), r.rejected(), "rejected matches stats");
+        assertEquals(s.rejected(), r.rejected(), "rejected matches legacy stats");
         assertEquals(s.submitted(), r.total(), "every submitted tick has exactly one ledger entry");
-        assertEquals(s.dropped(), r.evictedOld() + r.rejectedNew(), "dropped matches backpressure");
+        assertEquals(s.dropped(), r.evictedOld() + r.rejectedNew(), "dropped matches backpressure split");
+        assertEquals(s.evictedOld(), r.evictedOld(), "evicted-old split matches stats");
+        assertEquals(s.unfinished(), r.unfinished(), "unfinished matches stats");
         for (RejectReason reason : RejectReason.values()) {
             assertEquals(s.rejectedByReason().getOrDefault(reason, 0L),
                     r.rejectedByReason().getOrDefault(reason, 0L),
                     "byReason " + reason + " matches stats");
         }
+        // 历史口径恒等式
+        assertEquals(s.submitted(), s.accepted() + s.rejected() + s.evictedOld(),
+                "legacy identity submitted = accepted + rejected + evictedOld");
     }
 
     private void waitForTicks(SamplingGateway gw, String sensor, long untilTick, long timeoutMs)

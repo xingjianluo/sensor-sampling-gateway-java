@@ -49,8 +49,10 @@ class ReconciliationEndpointTests {
         long total = ((Number) report.get("total")).longValue();
         long accepted = ((Number) report.get("accepted")).longValue();
         long rejected = ((Number) report.get("rejected")).longValue();
+        long evictedOld = ((Number) report.get("evictedOld")).longValue();
         assertTrue(total > 0, "demo run should produce verdicts");
-        assertEquals(total, accepted + rejected, "endpoint report balanced");
+        assertEquals(total, accepted + rejected + evictedOld,
+                "endpoint report balanced under legacy split semantics");
 
         Map<String, Number> byReason = (Map<String, Number>) report.get("rejectedByReason");
         long sumByReason = byReason.values().stream().mapToLong(Number::longValue).sum();

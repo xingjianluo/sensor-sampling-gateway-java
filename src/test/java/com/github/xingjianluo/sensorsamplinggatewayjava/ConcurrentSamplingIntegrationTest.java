@@ -111,13 +111,19 @@ class ConcurrentSamplingIntegrationTest {
         assertNoDuplicateKeys(gw.verdictLog().recent());
         // 容量为1 + DROP_OLDEST + 高速生产者：应观测到驱逐
         assertTrue(s.dropped() > 0, "expected DROP_OLDEST evictions under pressure");
+        assertTrue(s.evictedOld() > 0, "evicted-old backpressure split out");
         long overflowCount = s.rejectedByReason().getOrDefault(RejectReason.BUFFER_OVERFLOW, 0L);
-        assertTrue(overflowCount > 0, "evicted oldest form BUFFER_OVERFLOW verdicts");
-        // 正确不变量（每个 sensor#tick 恰一条结论）：submitted = accepted + rejected，
-        // 且背压 dropped = byReason[BUFFER_OVERFLOW]（驱逐 + 直接拒绝）
-        assertEquals(s.submitted(), s.accepted() + s.rejected(),
-                "submitted must equal accepted + rejected");
-        assertEquals(s.dropped(), overflowCount, "dropped equals BUFFER_OVERFLOW rejections");
+        // 历史口径：纯 DROP_OLDEST 路径下没有“直接丢弃最新读数”，老计数 BUFFER_OVERFLOW 为 0
+        assertEquals(0L, overflowCount, "evicted oldest never inflate legacy rejected/BUFFER_OVERFLOW");
+        // 历史口径不变量：被顶掉读数单列（evictedOld），不重复计入 rejected
+        assertEquals(s.submitted(), s.accepted() + s.rejected() + s.evictedOld(),
+                "legacy identity: submitted = accepted + rejected + evictedOld");
+        assertEquals(s.enqueued(), s.consumed() + s.evictedOld(),
+                "legacy identity: enqueued = consumed + evictedOld");
+        assertEquals(s.submitted(), s.enqueued() + s.rejected(),
+                "legacy identity: submitted = enqueued + rejected");
+        assertEquals(s.dropped(), s.evictedOld() + s.rejectedNew(),
+                "dropped = evictedOld + rejectedNew (two backpressure kinds)");
         logSummary("DROP_OLDEST", gw);
     }
 

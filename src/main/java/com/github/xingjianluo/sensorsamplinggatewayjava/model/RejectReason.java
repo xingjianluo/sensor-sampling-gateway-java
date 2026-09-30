@@ -15,5 +15,10 @@ public enum RejectReason {
     /** 传感器已被故障隔离，不再受理其读数。 */
     SENSOR_ISOLATED,
     /** 采样动作在有界重试后仍失败（设备瞬时/持续故障）。 */
-    ACQUISITION_FAILED
+    ACQUISITION_FAILED,
+    /**
+     * 已受理（已入队）读数在关闭排空超时后仍滞留缓冲、未完成有效性判定。
+     * 这是可定位的“未完成”记录，而不是静默丢失：生产总数仍可与对账总数闭合。
+     */
+    SHUTDOWN_INCOMPLETE
 }

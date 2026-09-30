@@ -7,22 +7,33 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.EnumMap;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * 采样对账台账：所有裁决的单一对账事实源（single source of truth）。
  *
- * <p>每次 start/restart 开启一个“代次（批次）”，优雅停止时封代。每条 {@link Verdict}
- * 落账为一条 {@link ReconciliationEntry}，身份键 {@code (generation, sensorId, tick)}
- * 全局唯一。代次级与传感器级的聚合计数在落账时原子维护，<b>精确且不受明细保留滚动
- * 影响</b>；明细按代次有界保留，超容量行为由 {@link RetentionPolicy} 确定。</p>
+ * <p>每次 start/restart 开启一个“代次（批次）”，优雅停止时封代；<b>运行中切换规则版本
+ * 不开新代</b>：同一次运行可含多个规则版本，每条落账携带其“被受理时”的版本，
+ * 代内按版本各自精确聚合。身份键 {@code (generation, sensorId, tick)} 全局唯一。</p>
  *
- * <p>对账闭合：整代（或不带时间切片的任意组合）报告直接来自精确聚合计数，
- * {@code total = accepted + rejected = accepted + ΣbyReason}，
- * 且 {@code byReason[BUFFER_OVERFLOW] = evictedOld + rejectedNew}。
- * 时间范围切片需要逐条扫描明细，仅在涉及代次明细完整保留时才标记 complete。</p>
+ * <p><b>沿用历史统计口径（不改老计数）</b>：DROP_OLDEST 被顶掉的读数在台账中是一条
+ * 带 BUFFER_OVERFLOW 原因、{@code EVICTED_OLD} 背压标记的拒绝明细，但单列计数、
+ * <b>不</b>计入 {@code rejected} 与 {@code rejectedByReason}；后者只含直接丢弃
+ * （{@code REJECTED_NEW}）。闭合恒等式：</p>
+ * <pre>
+ * total      = accepted + rejected + evictedOld
+ * rejected   = Σ rejectedByReason
+ * rejectedNew = rejectedByReason[BUFFER_OVERFLOW]
+ * backpressure = evictedOld + rejectedNew
+ * </pre>
+ *
+ * <p>关闭排空超时仍滞留缓冲的已受理读数以 {@code SHUTDOWN_INCOMPLETE} 原因落账
+ * （计入 rejected/total，可在明细中定位），并同时累加到 {@code unfinished}；
+ * 这类报告 {@code complete=false}，显式标注不完整。</p>
  *
  * <p>线程安全：所有读写由内部一把锁与原子序列号保护；查询/报告返回不可变快照。</p>
  */
@@ -173,7 +184,7 @@ public final class ReconciliationStore {
             List<GenerationLedger> matched = new ArrayList<>();
             long touchedRollover = 0L;
             for (GenerationLedger l : ledgers.values()) {
-                if (f.matchesGeneration(l.id) && f.matchesRules(l.rulesVersion)) {
+                if (f.matchesGeneration(l.id) && l.hasRulesVersion(f)) {
                     matched.add(l);
                     touchedRollover += l.detailRollover;
                 }
@@ -181,63 +192,63 @@ public final class ReconciliationStore {
 
             boolean hasTimeFilter = f.fromRecordedMs() > 0L || f.toRecordedMs() > 0L;
             Accumulator acc = new Accumulator();
-            boolean complete;
+            boolean detailsComplete;
             Map<String, SensorTotalsAcc> perSensor = new LinkedHashMap<>();
             List<ReconciliationEntry> acceptedEntries = new ArrayList<>();
             List<ReconciliationEntry> rejectedEntries = new ArrayList<>();
 
             if (hasTimeFilter) {
-                // 时间切片：只能逐条扫描明细。涉及代次全部完整保留时结论才精确。
-                complete = true;
+                // 时间切片：只能逐条扫描明细。涉及代次明细完整保留且无未完成读数时才完整。
+                detailsComplete = true;
                 for (GenerationLedger l : matched) {
                     if (l.detailRollover > 0L) {
-                        complete = false;
+                        detailsComplete = false;
                     }
                     for (ReconciliationEntry e : l.details) {
-                        if (f.matchesSensor(e.sensorId()) && f.matchesTime(e.recordedAtMs())) {
+                        if (f.matchesSensor(e.sensorId())
+                                && f.matchesRules(e.rulesVersion())
+                                && f.matchesTime(e.recordedAtMs())) {
                             acc.add(e);
                             perSensor.computeIfAbsent(e.sensorId(), k -> new SensorTotalsAcc()).add(e);
-                            if (e.accepted()) {
-                                acceptedEntries.add(e);
-                            } else {
-                                rejectedEntries.add(e);
-                            }
+                            classifyDetail(e, acceptedEntries, rejectedEntries);
                         }
                     }
                 }
+                detailsComplete = detailsComplete && acc.unfinished == 0L;
             } else {
-                // 无时间切片：聚合计数来自精确的代次/传感器级累加器，永远精确。
-                // complete 取决于匹配口径下的明细是否一条不少（明细数 == 精确总数）。
-                complete = true;
+                // 无时间切片：聚合计数来自精确的代次/版本/传感器级累加器，永远精确。
                 long exactMatchedTotal = 0L;
                 long detailMatchedTotal = 0L;
                 for (GenerationLedger l : matched) {
-                    if (f.sensorId() == null || f.sensorId().isBlank()) {
-                        acc.add(l);
-                        exactMatchedTotal += l.total;
-                        for (SensorAgg sa : l.perSensor.values()) {
-                            perSensor.computeIfAbsent(sa.sensorId, k -> new SensorTotalsAcc()).add(sa);
+                    // 精确聚合：在代内按匹配的规则版本取版本级聚合，再按传感器筛选
+                    for (VersionAgg va : l.byVersion.values()) {
+                        if (!f.matchesRules(va.rulesVersion)) {
+                            continue;
                         }
-                    } else {
-                        SensorAgg sa = l.perSensor.get(f.sensorId());
-                        if (sa != null) {
-                            acc.add(sa);
-                            exactMatchedTotal += sa.total;
-                            perSensor.computeIfAbsent(f.sensorId(), k -> new SensorTotalsAcc()).add(sa);
-                        }
-                    }
-                    for (ReconciliationEntry e : l.details) {
-                        if (f.matchesSensor(e.sensorId())) {
-                            detailMatchedTotal++;
-                            if (e.accepted()) {
-                                acceptedEntries.add(e);
-                            } else {
-                                rejectedEntries.add(e);
+                        if (f.sensorId() == null || f.sensorId().isBlank()) {
+                            acc.add(va);
+                            exactMatchedTotal += va.total;
+                            for (SensorAgg sa : va.perSensor.values()) {
+                                perSensor.computeIfAbsent(sa.sensorId, k -> new SensorTotalsAcc()).add(sa);
+                            }
+                        } else {
+                            SensorAgg sa = va.perSensor.get(f.sensorId());
+                            if (sa != null) {
+                                acc.add(sa);
+                                exactMatchedTotal += sa.total;
+                                perSensor.computeIfAbsent(f.sensorId(), k -> new SensorTotalsAcc()).add(sa);
                             }
                         }
                     }
+                    // 明细扫描：版本条件同样作用于条目本身
+                    for (ReconciliationEntry e : l.details) {
+                        if (f.matchesSensor(e.sensorId()) && f.matchesRules(e.rulesVersion())) {
+                            detailMatchedTotal++;
+                            classifyDetail(e, acceptedEntries, rejectedEntries);
+                        }
+                    }
                 }
-                complete = (detailMatchedTotal == exactMatchedTotal);
+                detailsComplete = (detailMatchedTotal == exactMatchedTotal) && acc.unfinished == 0L;
             }
 
             acceptedEntries.sort(java.util.Comparator.comparingLong(ReconciliationEntry::seq));
@@ -246,29 +257,41 @@ public final class ReconciliationStore {
             Map<String, ReconciliationReport.SensorTotals> perSensorOut = new LinkedHashMap<>();
             perSensor.forEach((sid, a) -> perSensorOut.put(sid,
                     new ReconciliationReport.SensorTotals(
-                            a.total, a.accepted, a.rejected, a.evictedOld, a.rejectedNew)));
+                            a.total, a.accepted, a.rejected, a.evictedOld, a.rejectedNew, a.unfinished)));
 
             ReconciliationReport report = new ReconciliationReport(
-                    f, generatedAt, complete,
+                    f, generatedAt, detailsComplete,
                     acc.total, acc.accepted, acc.rejected,
-                    acc.evictedOld, acc.rejectedNew,
+                    acc.evictedOld, acc.rejectedNew, acc.unfinished,
                     Map.copyOf(acc.byReason()),
                     List.copyOf(acceptedEntries), List.copyOf(rejectedEntries),
                     Map.copyOf(perSensorOut),
-                    complete ? 0L : touchedRollover);
+                    detailsComplete ? 0L : touchedRollover);
             validateClosure(report);
             return report;
         }
     }
 
+    private static void classifyDetail(ReconciliationEntry e,
+                                       List<ReconciliationEntry> acceptedEntries,
+                                       List<ReconciliationEntry> rejectedEntries) {
+        if (e.accepted()) {
+            acceptedEntries.add(e);
+        } else {
+            // 含有效性拒绝、直接丢弃、被顶掉（EVICTED_OLD）与未完成（SHUTDOWN_INCOMPLETE）
+            rejectedEntries.add(e);
+        }
+    }
+
     /**
      * 自校验：任何对账报告内部都必须闭合、身份键唯一；不闭合直接报错而非静默给出错账。
-     * 聚合计数（总数/接受/各原因拒绝/背压）始终精确；明细列表在 complete 时必须与计数
-     * 一一对应，在不完整（明细已部分滚动）时允许是计数的真子集，但仍需自洽、无重复。
+     * 聚合计数（总数/接受/各原因拒绝/背压/未完成）始终精确；明细列表在 complete 时
+     * 必须与计数一一对应，不完整（明细滚动或有未完成读数）时允许是真子集，但仍需自洽、无重复。
      */
     private static void validateClosure(ReconciliationReport r) {
-        if (r.total() != r.accepted() + r.rejected()) {
-            throw new IllegalStateException("ledger not closed: total != accepted + rejected");
+        if (r.total() != r.accepted() + r.rejected() + r.evictedOld()) {
+            throw new IllegalStateException(
+                    "ledger not closed: total != accepted + rejected + evictedOld");
         }
         long sumByReason = 0L;
         for (long v : r.rejectedByReason().values()) {
@@ -278,17 +301,26 @@ public final class ReconciliationStore {
             throw new IllegalStateException("ledger not closed: rejected != sum(byReason)");
         }
         long overflow = r.rejectedByReason().getOrDefault(RejectReason.BUFFER_OVERFLOW, 0L);
-        if (overflow != r.evictedOld() + r.rejectedNew()) {
-            throw new IllegalStateException("ledger not closed: BUFFER_OVERFLOW != evictedOld + rejectedNew");
+        if (overflow != r.rejectedNew()) {
+            throw new IllegalStateException(
+                    "ledger not closed: byReason[BUFFER_OVERFLOW] != rejectedNew");
+        }
+        long unfinished = r.rejectedByReason().getOrDefault(RejectReason.SHUTDOWN_INCOMPLETE, 0L);
+        if (unfinished != r.unfinished()) {
+            throw new IllegalStateException(
+                    "ledger not closed: byReason[SHUTDOWN_INCOMPLETE] != unfinished");
         }
         if (r.acceptedEntries().size() > r.accepted()
-                || r.rejectedEntries().size() > r.rejected()) {
+                || r.rejectedEntries().size() > r.rejected() + r.evictedOld()) {
             throw new IllegalStateException("ledger not closed: detail lists exceed exact counts");
         }
         if (r.complete()) {
             if (r.accepted() != r.acceptedEntries().size()
-                    || r.rejected() != r.rejectedEntries().size()) {
+                    || r.rejected() + r.evictedOld() != r.rejectedEntries().size()) {
                 throw new IllegalStateException("complete report must carry every matching detail");
+            }
+            if (r.unfinished() != 0L) {
+                throw new IllegalStateException("complete report must not carry unfinished readings");
             }
         }
         java.util.HashSet<String> keys = new java.util.HashSet<>();
@@ -301,6 +333,10 @@ public final class ReconciliationStore {
             if (e.accepted() || e.reason() == null
                     || !keys.add(e.generation() + "#" + e.sensorTickKey())) {
                 throw new IllegalStateException("invalid/duplicate rejected entry: " + e.sensorTickKey());
+            }
+            if (e.backpressure() == BackpressureKind.EVICTED_OLD
+                    && e.reason() != RejectReason.BUFFER_OVERFLOW) {
+                throw new IllegalStateException("evicted-old entry must carry BUFFER_OVERFLOW");
             }
         }
     }
@@ -371,18 +407,23 @@ public final class ReconciliationStore {
         long rejected;
         long evictedOld;
         long rejectedNew;
+        long unfinished;
 
         void add(ReconciliationEntry e) {
             total++;
             if (e.accepted()) {
                 accepted++;
+            } else if (e.backpressure() == BackpressureKind.EVICTED_OLD) {
+                // 历史口径：被顶掉单列，不计 rejected
+                evictedOld++;
             } else {
                 rejected++;
-            }
-            if (e.backpressure() == BackpressureKind.EVICTED_OLD) {
-                evictedOld++;
-            } else if (e.backpressure() == BackpressureKind.REJECTED_NEW) {
-                rejectedNew++;
+                if (e.backpressure() == BackpressureKind.REJECTED_NEW) {
+                    rejectedNew++;
+                }
+                if (e.reason() == RejectReason.SHUTDOWN_INCOMPLETE) {
+                    unfinished++;
+                }
             }
         }
 
@@ -392,16 +433,18 @@ public final class ReconciliationStore {
             rejected += sa.rejected;
             evictedOld += sa.evictedOld;
             rejectedNew += sa.rejectedNew;
+            unfinished += sa.unfinished;
         }
     }
 
-    /** 精确聚合计数累加器（代次级 / 传感器级同构）。 */
+    /** 精确聚合计数累加器（代次级 / 版本级 / 传感器级同构）。 */
     private static final class Accumulator {
         long total;
         long accepted;
         long rejected;
         long evictedOld;
         long rejectedNew;
+        long unfinished;
         final EnumMap<RejectReason, Long> byReason = new EnumMap<>(RejectReason.class);
 
         Accumulator() {
@@ -414,14 +457,20 @@ public final class ReconciliationStore {
             total++;
             if (e.accepted()) {
                 accepted++;
-            } else {
-                rejected++;
-                byReason.merge(e.reason(), 1L, Long::sum);
+                return;
             }
             if (e.backpressure() == BackpressureKind.EVICTED_OLD) {
+                // 历史口径：被顶掉读数单列，不进 rejected / byReason
                 evictedOld++;
-            } else if (e.backpressure() == BackpressureKind.REJECTED_NEW) {
+                return;
+            }
+            rejected++;
+            byReason.merge(e.reason(), 1L, Long::sum);
+            if (e.backpressure() == BackpressureKind.REJECTED_NEW) {
                 rejectedNew++;
+            }
+            if (e.reason() == RejectReason.SHUTDOWN_INCOMPLETE) {
+                unfinished++;
             }
         }
 
@@ -431,16 +480,18 @@ public final class ReconciliationStore {
             rejected += sa.rejected;
             evictedOld += sa.evictedOld;
             rejectedNew += sa.rejectedNew;
+            unfinished += sa.unfinished;
             sa.byReason.forEach((reason, n) -> byReason.merge(reason, n, Long::sum));
         }
 
-        void add(GenerationLedger l) {
-            total += l.total;
-            accepted += l.accepted;
-            rejected += l.rejected;
-            evictedOld += l.evictedOld;
-            rejectedNew += l.rejectedNew;
-            l.byReason.forEach((reason, n) -> byReason.merge(reason, n, Long::sum));
+        void add(VersionAgg va) {
+            total += va.total;
+            accepted += va.accepted;
+            rejected += va.rejected;
+            evictedOld += va.evictedOld;
+            rejectedNew += va.rejectedNew;
+            unfinished += va.unfinished;
+            va.byReason.forEach((reason, n) -> byReason.merge(reason, n, Long::sum));
         }
 
         Map<RejectReason, Long> byReason() {
@@ -448,7 +499,7 @@ public final class ReconciliationStore {
         }
     }
 
-    /** 单个传感器在一代内的精确聚合。 */
+    /** 单个传感器在某代/某版本内的精确聚合。 */
     private static final class SensorAgg {
         final String sensorId;
         long total;
@@ -456,6 +507,7 @@ public final class ReconciliationStore {
         long rejected;
         long evictedOld;
         long rejectedNew;
+        long unfinished;
         final EnumMap<RejectReason, Long> byReason = new EnumMap<>(RejectReason.class);
 
         SensorAgg(String sensorId) {
@@ -469,22 +521,66 @@ public final class ReconciliationStore {
             total++;
             if (e.accepted()) {
                 accepted++;
-            } else {
-                rejected++;
-                byReason.merge(e.reason(), 1L, Long::sum);
+                return;
             }
             if (e.backpressure() == BackpressureKind.EVICTED_OLD) {
                 evictedOld++;
-            } else if (e.backpressure() == BackpressureKind.REJECTED_NEW) {
+                return;
+            }
+            rejected++;
+            byReason.merge(e.reason(), 1L, Long::sum);
+            if (e.backpressure() == BackpressureKind.REJECTED_NEW) {
                 rejectedNew++;
+            }
+            if (e.reason() == RejectReason.SHUTDOWN_INCOMPLETE) {
+                unfinished++;
             }
         }
     }
 
-    /** 一个运行代次（批次）的账本：有界明细 + 精确聚合。 */
+    /** 同一代次内一个规则版本的精确聚合（支持运行中切换规则版本后按版本切片）。 */
+    private static final class VersionAgg {
+        final String rulesVersion;
+        long total;
+        long accepted;
+        long rejected;
+        long evictedOld;
+        long rejectedNew;
+        long unfinished;
+        final EnumMap<RejectReason, Long> byReason = new EnumMap<>(RejectReason.class);
+        final LinkedHashMap<String, SensorAgg> perSensor = new LinkedHashMap<>();
+
+        VersionAgg(String rulesVersion) {
+            this.rulesVersion = rulesVersion;
+            for (RejectReason r : RejectReason.values()) {
+                byReason.put(r, 0L);
+            }
+        }
+
+        void add(ReconciliationEntry e) {
+            total++;
+            if (e.accepted()) {
+                accepted++;
+            } else if (e.backpressure() == BackpressureKind.EVICTED_OLD) {
+                evictedOld++;
+            } else {
+                rejected++;
+                byReason.merge(e.reason(), 1L, Long::sum);
+                if (e.backpressure() == BackpressureKind.REJECTED_NEW) {
+                    rejectedNew++;
+                }
+                if (e.reason() == RejectReason.SHUTDOWN_INCOMPLETE) {
+                    unfinished++;
+                }
+            }
+            perSensor.computeIfAbsent(e.sensorId(), SensorAgg::new).add(e);
+        }
+    }
+
+    /** 一个运行代次（批次）的账本：有界明细 + 代/版本/传感器三级精确聚合。 */
     private static final class GenerationLedger {
         final long id;
-        final String rulesVersion;
+        final String startRulesVersion;
         final long startedAtMs;
         long sealedAtMs;
         boolean sealed;
@@ -495,39 +591,64 @@ public final class ReconciliationStore {
         long rejected;
         long evictedOld;
         long rejectedNew;
+        long unfinished;
         long detailRollover;
+        /** 该代出现过的规则版本（按首次出现顺序，去重）。 */
+        final LinkedHashSet<String> rulesVersions = new LinkedHashSet<>();
         final EnumMap<RejectReason, Long> byReason = new EnumMap<>(RejectReason.class);
         final LinkedHashMap<String, SensorAgg> perSensor = new LinkedHashMap<>();
+        final LinkedHashMap<String, VersionAgg> byVersion = new LinkedHashMap<>();
 
         GenerationLedger(long id, String rulesVersion, long startedAtMs) {
             this.id = id;
-            this.rulesVersion = rulesVersion;
+            this.startRulesVersion = rulesVersion;
             this.startedAtMs = startedAtMs;
+            this.rulesVersions.add(rulesVersion);
             for (RejectReason r : RejectReason.values()) {
                 byReason.put(r, 0L);
             }
         }
 
+        boolean hasRulesVersion(ReconciliationFilter f) {
+            if (f.rulesVersion() == null || f.rulesVersion().isBlank()) {
+                return true;
+            }
+            for (String v : rulesVersions) {
+                if (f.matchesRules(v)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
         void add(ReconciliationEntry e) {
+            rulesVersions.add(e.rulesVersion());
+            byVersion.computeIfAbsent(e.rulesVersion(), VersionAgg::new).add(e);
+            perSensor.computeIfAbsent(e.sensorId(), SensorAgg::new).add(e);
+
             total++;
             if (e.accepted()) {
                 accepted++;
-            } else {
-                rejected++;
-                byReason.merge(e.reason(), 1L, Long::sum);
+                return;
             }
             if (e.backpressure() == BackpressureKind.EVICTED_OLD) {
                 evictedOld++;
-            } else if (e.backpressure() == BackpressureKind.REJECTED_NEW) {
+                return;
+            }
+            rejected++;
+            byReason.merge(e.reason(), 1L, Long::sum);
+            if (e.backpressure() == BackpressureKind.REJECTED_NEW) {
                 rejectedNew++;
             }
-            perSensor.computeIfAbsent(e.sensorId(), SensorAgg::new).add(e);
+            if (e.reason() == RejectReason.SHUTDOWN_INCOMPLETE) {
+                unfinished++;
+            }
         }
 
         GenerationInfo info() {
-            return new GenerationInfo(id, rulesVersion, startedAtMs, sealedAtMs, sealed,
-                    total, accepted, rejected, evictedOld, rejectedNew,
-                    details.size(), detailRollover);
+            return new GenerationInfo(id, startRulesVersion, startedAtMs, sealedAtMs, sealed,
+                    total, accepted, rejected, evictedOld, rejectedNew, unfinished,
+                    details.size(), detailRollover, List.copyOf(rulesVersions));
         }
     }
 }

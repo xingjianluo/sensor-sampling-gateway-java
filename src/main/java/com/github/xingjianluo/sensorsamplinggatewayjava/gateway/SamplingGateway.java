@@ -22,6 +22,7 @@ import com.github.xingjianluo.sensorsamplinggatewayjava.time.Clock;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -54,6 +55,14 @@ public final class SamplingGateway {
     private volatile VerdictLog verdictLog;
     private final ReadingValidator validator;
     private final ReconciliationStore reconciliation;
+
+    /**
+     * 运行中切换规则版本时，历史配置快照仍要服务于“切换前已受理、尚未消费”的读数
+     * （按其受理版本判定与校准）。按 rulesVersion 保留本次运行中出现过的全部配置。
+     */
+    private final Map<String, GatewayConfig> configsByRulesVersion = new ConcurrentHashMap<>();
+    /** 测试钩子：消费者每取走一条读数后执行（用于确定性制造关闭排空滞留）。 */
+    private volatile Runnable consumerHook = () -> { };
 
     private BoundedBuffer buffer;
     private final Map<String, CircuitBreaker> breakers = new ConcurrentHashMap<>();
@@ -96,10 +105,19 @@ public final class SamplingGateway {
                 config.reconcileMaxSealedGenerations(),
                 config.reconcileRetentionPolicy());
         this.buffer = new BoundedBuffer(config.bufferCapacity(), config.overflowPolicy());
+        configsByRulesVersion.put(config.rulesVersion(), config);
         for (SensorConfig sc : config.sensors()) {
             breakers.put(sc.getId(),
                     new CircuitBreaker(sc.getId(), config.breakerThreshold(), config.breakerCooldownMs()));
         }
+    }
+
+    /**
+     * 测试用：设置消费者钩子（每消费一条读数后运行）。例如阻塞住消费者以确定性地
+     * 制造“关闭时仍有读数滞留缓冲”的边界。生产路径保持无操作。
+     */
+    public void setConsumerHookForTesting(Runnable hook) {
+        this.consumerHook = hook == null ? () -> { } : hook;
     }
 
     public synchronized void start() {
@@ -143,28 +161,32 @@ public final class SamplingGateway {
         producerPool.shutdown();
     }
 
-    /** 生产者循环：周期节拍 + 断路器 + 有界重试退避 + 入队。 */
+    /** 生产者循环：周期节拍 + 断路器 + 有界重试退避 + 入站。 */
     private void produceLoop(Sensor sensor) {
         String id = sensor.config().getId();
-        long period = sensor.config().getPeriodMs();
         AtomicLong tick = new AtomicLong();
         CircuitBreaker breaker = breakers.get(id);
         while (running.get() && !stopRequested.get()) {
+            // 每拍开始时快照当前规则版本：切换规则后新产生的拍按新版本判定，
+            // 切换前已受理（已入队）的读数由消费者按其入队时携带的版本判定。
+            GatewayConfig tickConfig = config;
+            long period = sensor.config().getPeriodMs();
             long t = tick.getAndIncrement();
             try {
                 if (!breaker.allowRequest(clock.nowMillis())) {
                     stats.submitted();
                     stats.rejected(RejectReason.SENSOR_ISOLATED);
                     record(Verdict.reject(
-                            new RawReading(id, t, clock.nowMillis(), Double.NaN, Long.MIN_VALUE),
+                            new RawReading(id, t, clock.nowMillis(), Double.NaN, Long.MIN_VALUE,
+                                    tickConfig.rulesVersion()),
                             RejectReason.SENSOR_ISOLATED,
                             "input{tick=" + t + "}; rule=breaker OPEN after "
                                     + breaker.consecutiveFailures() + " consecutive failures -> SENSOR_ISOLATED",
-                            config.rulesVersion()));
+                            tickConfig.rulesVersion()));
                     sleepPeriod(period);
                     continue;
                 }
-                RawReading reading = sampleWithRetry(sensor, t, breaker);
+                RawReading reading = sampleWithRetry(sensor, t, breaker, tickConfig);
                 if (reading == null) {
                     // 有界重试后仍失败：breakFailure 已记失败结论
                     sleepPeriod(period);
@@ -175,9 +197,13 @@ public final class SamplingGateway {
                     // 关闭已开始：未提交读数不进入“已受理”集合，避免重/漏歧义
                     return;
                 }
+                // 入队前一刻再次取版本作为“受理版本”：该读数此后无论何时被消费，
+                // 都按此版本判定与校准（运行中切换规则不重判在途读数）。
+                GatewayConfig admitConfig = config;
                 stats.submitted();
-                BoundedBuffer.OfferResult result = buffer.offer(reading);
-                handleOfferResult(result);
+                BoundedBuffer.OfferResult result = buffer.offer(
+                        reading.withRulesVersion(admitConfig.rulesVersion()));
+                handleOfferResult(result, admitConfig);
             } catch (SamplingLimitReached stop) {
                 // 协作式停止：该传感器声明采样结束，生产者干净退出，不产生裁决与计数
                 LOG.fine(() -> "producer for " + id + " finished at tick " + t);
@@ -198,9 +224,10 @@ public final class SamplingGateway {
     }
 
     /** 有界重试 + 指数退避；全部失败返回 null 并记录失败结论。 */
-    private RawReading sampleWithRetry(Sensor sensor, long tick, CircuitBreaker breaker)
+    private RawReading sampleWithRetry(Sensor sensor, long tick, CircuitBreaker breaker,
+                                       GatewayConfig tickConfig)
             throws InterruptedException {
-        final RetryPolicy retry = config.retryPolicy();
+        final RetryPolicy retry = tickConfig.retryPolicy();
         SensorFaultException lastFault = null;
         for (int attempt = 1; attempt <= retry.maxAttempts(); attempt++) {
             try {
@@ -231,43 +258,44 @@ public final class SamplingGateway {
         stats.rejected(RejectReason.ACQUISITION_FAILED);
         boolean isolatedNow = breaker.state(clock.nowMillis()) == CircuitBreaker.State.OPEN;
         record(Verdict.reject(
-                new RawReading(sensor.config().getId(), tick, clock.nowMillis(), Double.NaN, Long.MIN_VALUE),
+                new RawReading(sensor.config().getId(), tick, clock.nowMillis(), Double.NaN, Long.MIN_VALUE,
+                        tickConfig.rulesVersion()),
                 RejectReason.ACQUISITION_FAILED,
                 "input{tick=" + tick + ",fault=" + lastFault.getMessage()
                         + ",recoverable=" + lastFault.isRecoverable()
                         + ",attempts=" + retry.maxAttempts() + "}; rule=bounded retry exhausted"
                         + (isolatedNow ? ", breaker OPEN -> sensor isolated" : "")
                         + " -> ACQUISITION_FAILED",
-                config.rulesVersion()));
+                tickConfig.rulesVersion()));
         return null;
     }
 
-    private void handleOfferResult(BoundedBuffer.OfferResult result) {
+    private void handleOfferResult(BoundedBuffer.OfferResult result, GatewayConfig admitConfig) {
         if (result.enqueued()) {
             stats.enqueued();
         } else {
-            // DROP_NEWEST 满队拒绝，或 BLOCK 在关闭后唤醒
+            // DROP_NEWEST 满队拒绝，或 BLOCK 在关闭后唤醒（直接丢弃最新读数）
             stats.rejected(RejectReason.BUFFER_OVERFLOW);
             RawReading r = result.rejectedReading();
             record(Verdict.reject(r, RejectReason.BUFFER_OVERFLOW,
                     "input{sensor=" + r.sensorId() + ",tick=" + r.tick()
                             + "}; rule=buffer(capacity=" + buffer.capacity() + ",policy=" + result.policy()
                             + ") rejected newest on full/closed -> BUFFER_OVERFLOW",
-                    config.rulesVersion()), BackpressureKind.REJECTED_NEW);
+                    admitConfig.rulesVersion()), BackpressureKind.REJECTED_NEW);
         }
         if (result.evictedReading() != null) {
-            // DROP_OLDEST：新读数已入队（已计 enqueued），被驱逐的旧读数单独形成一条可区分结论
+            // DROP_OLDEST：新读数已入队（已计 enqueued），被顶掉的旧读数单独形成一条可区分结论。
             RawReading ev = result.evictedReading();
-            // 被顶掉的旧读数同样是一次拒绝落账：统一走 rejected(BUFFER_OVERFLOW)，
-            // 它同时使 dropped+1。最终 dropped = evicted + rejectedNew
-            // = byReason[BUFFER_OVERFLOW]，且 submitted = accepted + rejected 严格成立，
-            // 与对账台账（evictedOld / rejectedNew 分列）口径一致。
-            stats.rejected(RejectReason.BUFFER_OVERFLOW);
+            // 历史统计口径：被顶掉读数只单列（stats.droppedEviction / 台账 evictedOld），
+            // 不计入 rejected / byReason[BUFFER_OVERFLOW]；后者仅统计“直接丢弃最新读数”。
+            // 账目闭合：submitted = accepted + rejected + evictedOld（见 README 口径）。
+            stats.droppedEviction();
             record(Verdict.reject(ev, RejectReason.BUFFER_OVERFLOW,
                     "input{sensor=" + ev.sensorId() + ",tick=" + ev.tick()
                             + "}; rule=buffer(capacity=" + buffer.capacity()
                             + ",policy=DROP_OLDEST) evicted oldest to make room -> BUFFER_OVERFLOW",
-                    config.rulesVersion()), BackpressureKind.EVICTED_OLD);
+                    ev.rulesVersion() != null ? ev.rulesVersion() : admitConfig.rulesVersion()),
+                    BackpressureKind.EVICTED_OLD);
         }
     }
 
@@ -283,6 +311,7 @@ public final class SamplingGateway {
                     continue;
                 }
                 process(reading);
+                consumerHook.run();
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -291,22 +320,26 @@ public final class SamplingGateway {
 
     private void process(RawReading reading) {
         stats.consumed();
-        SensorConfig sc = config.sensorConfig(reading.sensorId());
+        // 按“受理时”的规则版本取配置快照：切换前入队的在途读数仍按旧版本判定/校准。
+        GatewayConfig verdictConfig = reading.rulesVersion() == null
+                ? config
+                : configsByRulesVersion.getOrDefault(reading.rulesVersion(), config);
+        SensorConfig sc = verdictConfig.sensorConfig(reading.sensorId());
         RejectReason reason = sc == null ? null : validator.validate(reading, sc);
         if (reason != null) {
             stats.rejected(reason);
             record(Verdict.reject(reading, reason,
                     sc == null ? "sensor config missing" : validator.describe(reading, sc, reason),
-                    config.rulesVersion()));
+                    verdictConfig.rulesVersion()));
             return;
         }
-        double calibrated = config.calibration().apply(reading.sensorId(), reading.value());
+        double calibrated = verdictConfig.calibration().apply(reading.sensorId(), reading.value());
         stats.accepted();
         record(Verdict.accept(reading, calibrated,
                 String.format("input{sensor=%s,tick=%d,value=%.4f}; rule=valid, calibrated=%.6f (model=%s)",
                         reading.sensorId(), reading.tick(), reading.value(),
-                        calibrated, config.calibration().getVersion()),
-                config.rulesVersion()));
+                        calibrated, verdictConfig.calibration().getVersion()),
+                verdictConfig.rulesVersion()));
     }
 
     private void record(Verdict verdict) {
@@ -343,14 +376,40 @@ public final class SamplingGateway {
             Thread.currentThread().interrupt();
             LOG.warning("interrupted while draining enqueued readings");
         }
-        // 3) 关闭线程池（此后不再有新裁决产生；优雅关闭要求排空在超时内完成，
-        //    正常路径缓冲必为 0，见 LifecycleRestartTest）
+        // 3) 关闭线程池（此后不再有新裁决产生；优雅关闭要求排空在超时内完成）
         shutdownPool(consumerPool);
         shutdownPool(producerPool);
-        // 4) 封代：冻结本批次账目。已入队但排空超时仍滞留的读数不产生裁决，
-        //    会在对账中表现为缺口并触发闭合校验，属于需调大 shutdownDrainTimeoutMs 的告警情形。
+        // 3.1) 边界兜底：排空超时/消费者卡住后仍滞留缓冲的已受理读数，逐条明确落为
+        //      SHUTDOWN_INCOMPLETE（计入生产总数与拒绝、可按代次/传感器定位），
+        //      既不静默丢失、也不伪装成完整；与消费者取走的读数互斥，不重不漏。
+        int stranded = recordStrandedReadings();
+        if (stranded > 0) {
+            LOG.warning(() -> "shutdown incomplete: " + stranded
+                    + " accepted reading(s) stuck in buffer recorded as SHUTDOWN_INCOMPLETE"
+                    + " (consider increasing shutdown-drain-timeout-ms)");
+        }
+        // 4) 封代：冻结本批次账目（含未完成读数与不完整标记）。
         reconciliation.sealGeneration(clock.nowMillis());
         LOG.info("SamplingGateway stopped");
+    }
+
+    /**
+     * 关闭后排空兜底：把仍滞留在缓冲中的读数全部取出并落为 SHUTDOWN_INCOMPLETE。
+     * drainAll 与消费者 poll 互斥，因此每条已受理读数要么被消费、要么在此落账，恰一次。
+     */
+    private int recordStrandedReadings() {
+        List<RawReading> rest = buffer.drainAll();
+        for (RawReading r : rest) {
+            String version = r.rulesVersion() != null ? r.rulesVersion() : config.rulesVersion();
+            stats.unfinished();
+            stats.rejected(RejectReason.SHUTDOWN_INCOMPLETE);
+            record(Verdict.reject(r, RejectReason.SHUTDOWN_INCOMPLETE,
+                    "input{sensor=" + r.sensorId() + ",tick=" + r.tick()
+                            + "}; rule=reading stuck in buffer after shutdown drain timeout,"
+                            + " never validated -> SHUTDOWN_INCOMPLETE",
+                    version), BackpressureKind.NONE);
+        }
+        return rest.size();
     }
 
     private void shutdownPool(ExecutorService pool) {
@@ -383,6 +442,7 @@ public final class SamplingGateway {
 
     private void restartInternal(GatewayConfig newConfig, Map<String, Sensor> newSensors) {
         this.config = newConfig;
+        configsByRulesVersion.put(newConfig.rulesVersion(), newConfig);
         this.sensors = newSensors;
         this.breakers.clear();
         for (SensorConfig sc : newConfig.sensors()) {
@@ -401,6 +461,60 @@ public final class SamplingGateway {
     private void reinitBuffer(GatewayConfig cfg) {
         // field reassigned only while stopped
         this.buffer = new BoundedBuffer(cfg.bufferCapacity(), cfg.overflowPolicy());
+    }
+
+    /**
+     * <b>运行中切换规则版本</b>：不停机、不重启、不开新代次，在同一次运行里原子替换规则快照。
+     *
+     * <p>语义（并发安全）：</p>
+     * <ul>
+     *   <li>切换前<b>已受理（已入队）</b>的读数继续在同一缓冲内流动，消费者按其入队时
+     *       携带的旧版本完成校验/校准（旧配置快照按版本保留），结论与旧版本完全一致；</li>
+     *   <li>切换后<b>新产生</b>的读数（含切换后入队、隔离、采集失败等结论）按新版本判定；</li>
+     *   <li>两代规则的落账在同一代次内以 {@code rulesVersion} 区分，各自可筛选，
+     *       而整代总账仍闭合、身份键 {@code (generation,sensor,tick)} 唯一；</li>
+     *   <li>缓冲容量/溢出策略、线程池、断路器状态与 tick 序列都不重置，因此背压、并发、
+     *       故障恢复与切换叠加时也不重复、不漏记。</li>
+     * </ul>
+     *
+     * <p>新快照仅允许改变规则相关内容（规则版本、量程/容差等传感器配置、校准模型、
+     * 重试/断路器参数等）；传感器 id 集合必须与当前一致（增删传感器仍需走 restart），
+     * 缓冲容量与溢出策略也必须一致（运行中更换会破坏在途背压口径）。
+     *
+     * @throws IllegalStateException 网关未运行
+     * @throws IllegalArgumentException 新配置与在途运行结构不兼容
+     */
+    public synchronized void switchRules(GatewayConfig newConfig) {
+        if (!running.get()) {
+            throw new IllegalStateException("gateway is not running; use start/restart instead");
+        }
+        if (newConfig == null) {
+            throw new IllegalArgumentException("newConfig must not be null");
+        }
+        if (newConfig.rulesVersion().equals(config.rulesVersion())) {
+            throw new IllegalArgumentException(
+                    "switchRules requires a different rulesVersion, got " + newConfig.rulesVersion());
+        }
+        if (newConfig.bufferCapacity() != config.bufferCapacity()
+                || newConfig.overflowPolicy() != config.overflowPolicy()) {
+            throw new IllegalArgumentException(
+                    "buffer capacity/overflow policy cannot change during a run; use restart instead");
+        }
+        Set<String> oldIds = config.sensors().stream().map(SensorConfig::getId)
+                .collect(java.util.stream.Collectors.toCollection(java.util.TreeSet::new));
+        Set<String> newIds = newConfig.sensors().stream().map(SensorConfig::getId)
+                .collect(java.util.stream.Collectors.toCollection(java.util.TreeSet::new));
+        if (!oldIds.equals(newIds)) {
+            throw new IllegalArgumentException(
+                    "sensor id set cannot change during a run; use restart instead: " + oldIds + " != " + newIds);
+        }
+        GatewayConfig old = this.config;
+        this.config = newConfig;
+        configsByRulesVersion.put(newConfig.rulesVersion(), newConfig);
+        LOG.info(() -> "rules switched at runtime within generation "
+                + reconciliation.runningGeneration() + ": " + old.rulesVersion()
+                + " -> " + newConfig.rulesVersion()
+                + " (in-flight enqueued readings keep " + old.rulesVersion() + ")");
     }
 
     /** 请求生产者停止节拍（不关闭缓冲）。测试用于精确控制采样拍数。 */

@@ -38,7 +38,13 @@ public class SamplingController {
         out.put("bufferCapacity", gw.config().bufferCapacity());
         out.put("overflowPolicy", gw.config().overflowPolicy());
         out.put("queued", gw.bufferView().queued());
-        out.put("runningGeneration", gw.reconciliation().runningGeneration());
+        long genId = gw.reconciliation().runningGeneration();
+        out.put("runningGeneration", genId);
+        // 当前运行代次内出现过的全部规则版本（运行中切换会在同一批次内追加新版本）
+        com.github.xingjianluo.sensorsamplinggatewayjava.reconcile.GenerationInfo gen =
+                genId >= 1L ? gw.reconciliation().generation(genId) : null;
+        out.put("runningRulesVersions",
+                gen == null ? List.of() : gen.rulesVersions());
         return out;
     }
 
