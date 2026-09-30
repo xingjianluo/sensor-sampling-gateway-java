@@ -7,10 +7,12 @@ package com.github.xingjianluo.sensorsamplinggatewayjava.reconcile;
  * @param generationsCreated            累计创建的代次数
  * @param generationsRetained           当前仍保留（运行 + 已封代）的代次数
  * @param generationsPurged             因封代代次保留上限被确定性清除的代数数
- * @param entriesAppended               累计落账条数（每条读数恰好一条）
+ * @param entriesAppended               累计落账条数（每条读数恰好一条；含未完成补记）
  * @param detailsRetained               当前保留的明细总条数
  * @param detailsRollover               累计因明细容量上限被滚动/忽略的明细条数
- * @param appendsWhileNoRunningGen      无运行代次时的落账次数（确定性拒绝，不计数）
+ * @param incompleteAppended            累计关闭边界未完成补记条数
+ * @param duplicateAppendsIgnored       幂等保护忽略的重复落账次数
+ * @param appendsWhileNoRunningGen      无运行代次时的落账次数（确定性忽略，不计数）
  * @param detailCapacityPerGeneration   每代明细容量上限
  * @param maxSealedGenerations          封代代次保留上限
  * @param retentionPolicy               明细超容量后的行为
@@ -22,6 +24,8 @@ public record ReconciliationStoreStats(long runningGeneration,
                                        long entriesAppended,
                                        long detailsRetained,
                                        long detailsRollover,
+                                       long incompleteAppended,
+                                       long duplicateAppendsIgnored,
                                        long appendsWhileNoRunningGen,
                                        int detailCapacityPerGeneration,
                                        int maxSealedGenerations,

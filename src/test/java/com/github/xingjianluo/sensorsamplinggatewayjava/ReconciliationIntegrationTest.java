@@ -50,32 +50,57 @@ class ReconciliationIntegrationTest {
     }
 
     private static void assertReportClosed(ReconciliationReport r) {
-        assertEquals(r.total(), r.accepted() + r.rejected());
+        assertEquals(r.total(),
+                r.accepted() + r.rejected() + r.evictedOld() + r.incomplete());
         long byReason = r.rejectedByReason().values().stream().mapToLong(Long::longValue).sum();
         assertEquals(r.rejected(), byReason);
         long overflow = r.rejectedByReason().getOrDefault(RejectReason.BUFFER_OVERFLOW, 0L);
-        assertEquals(r.evictedOld() + r.rejectedNew(), overflow);
+        assertEquals(r.rejectedNew(), overflow, "direct BUFFER_OVERFLOW only; evictions split out");
+        assertEquals(r.backpressure(), r.evictedOld() + r.rejectedNew());
         Set<String> keys = new HashSet<>();
         for (ReconciliationEntry e : r.acceptedEntries()) {
             assertTrue(e.accepted());
+            assertEquals(com.github.xingjianluo.sensorsamplinggatewayjava.reconcile.Disposition.ACCEPTED,
+                    e.disposition());
             assertTrue(keys.add(e.generation() + "#" + e.sensorTickKey()));
         }
         for (ReconciliationEntry e : r.rejectedEntries()) {
             assertFalse(e.accepted());
+            assertEquals(com.github.xingjianluo.sensorsamplinggatewayjava.reconcile.Disposition.REJECTED,
+                    e.disposition());
             assertTrue(e.reason() != null, "rejected entry must carry a distinguishable reason");
             assertTrue(keys.add(e.generation() + "#" + e.sensorTickKey()), "no double counting");
         }
+        for (ReconciliationEntry e : r.evictedEntries()) {
+            assertFalse(e.accepted());
+            assertEquals(com.github.xingjianluo.sensorsamplinggatewayjava.reconcile.Disposition.EVICTED_OLD,
+                    e.disposition());
+            assertTrue(keys.add(e.generation() + "#" + e.sensorTickKey()), "evicted counted once");
+        }
+        for (ReconciliationEntry e : r.incompleteEntries()) {
+            assertEquals(com.github.xingjianluo.sensorsamplinggatewayjava.reconcile.Disposition.INCOMPLETE,
+                    e.disposition());
+            assertEquals(RejectReason.SHUTDOWN_INCOMPLETE, e.reason());
+            assertTrue(keys.add(e.generation() + "#" + e.sensorTickKey()), "incomplete counted once");
+        }
     }
 
-    /** 与 StatsCollector 互证：台账聚合必须等于网关统一计数（在明细未滚动时含明细数）。 */
+    /** 与 StatsCollector 互证：台账四类聚合必须等于网关统一计数（在明细未滚动时含明细数）。 */
     private static void assertMatchesStats(ReconciliationReport r, GatewayStats s) {
         assertEquals(s.accepted(), r.accepted(), "accepted matches stats");
-        assertEquals(s.rejected(), r.rejected(), "rejected matches stats");
-        assertEquals(s.submitted(), r.total(), "every submitted tick has exactly one ledger entry");
+        assertEquals(s.rejected(), r.rejected(), "rejected matches stats (evictions not inflated)");
+        assertEquals(s.submitted(),
+                r.accepted() + r.rejected() + r.evictedOld() + r.incomplete(),
+                "every submitted tick has exactly one ledger disposition");
+        assertEquals(s.evictedOld(), r.evictedOld(), "evictedOld matches stats");
+        assertEquals(s.rejectedNew(), r.rejectedNew(), "rejectedNew matches stats");
+        assertEquals(s.shutdownIncomplete(), r.incomplete(), "incomplete matches stats");
         assertEquals(s.dropped(), r.evictedOld() + r.rejectedNew(), "dropped matches backpressure");
         for (RejectReason reason : RejectReason.values()) {
-            assertEquals(s.rejectedByReason().getOrDefault(reason, 0L),
-                    r.rejectedByReason().getOrDefault(reason, 0L),
+            // SHUTDOWN_INCOMPLETE 独立分列，不计入 rejectedByReason
+            long expected = reason == RejectReason.SHUTDOWN_INCOMPLETE
+                    ? 0L : s.rejectedByReason().getOrDefault(reason, 0L);
+            assertEquals(expected, r.rejectedByReason().getOrDefault(reason, 0L),
                     "byReason " + reason + " matches stats");
         }
     }
@@ -90,11 +115,17 @@ class ReconciliationIntegrationTest {
                     .filter(e -> e.sensorId().equals(sensor))
                     .map(ReconciliationEntry::tick)
                     .collect(Collectors.toCollection(HashSet::new));
-            gw.reconciliation()
-                    .reconcile(ReconciliationFilter.forGeneration(gen)).acceptedEntries().stream()
+            var genReport = gw.reconciliation().reconcile(ReconciliationFilter.forGeneration(gen));
+            genReport.acceptedEntries().stream()
                     .filter(e -> e.sensorId().equals(sensor))
-                    .map(ReconciliationEntry::tick)
-                    .forEach(ticks::add);
+                    .map(ReconciliationEntry::tick).forEach(ticks::add);
+            // 被顶掉 / 关闭未完成也是终结，等待时同样算“已落账”
+            genReport.evictedEntries().stream()
+                    .filter(e -> e.sensorId().equals(sensor))
+                    .map(ReconciliationEntry::tick).forEach(ticks::add);
+            genReport.incompleteEntries().stream()
+                    .filter(e -> e.sensorId().equals(sensor))
+                    .map(ReconciliationEntry::tick).forEach(ticks::add);
             boolean complete = true;
             for (long t = 0; t <= untilTick; t++) {
                 if (!ticks.contains(t)) {
@@ -149,10 +180,12 @@ class ReconciliationIntegrationTest {
         }
         // 接受明细即“真正交付出去”的读数，全部 accepted 且有校准值
         assertTrue(r.acceptedEntries().stream().allMatch(ReconciliationEntry::accepted));
-        // VerdictLog 与台账逐条一致（身份键集合相同）
+        // VerdictLog 与台账逐条一致（身份键集合相同，覆盖四类终结）
         Set<String> ledgerKeys = new HashSet<>();
         r.acceptedEntries().forEach(e -> ledgerKeys.add(e.sensorTickKey()));
         r.rejectedEntries().forEach(e -> ledgerKeys.add(e.sensorTickKey()));
+        r.evictedEntries().forEach(e -> ledgerKeys.add(e.sensorTickKey()));
+        r.incompleteEntries().forEach(e -> ledgerKeys.add(e.sensorTickKey()));
         Set<String> verdictKeys = gw.verdictLog().recent().stream()
                 .map(v -> v.reading().key()).collect(Collectors.toSet());
         assertEquals(ledgerKeys, verdictKeys, "ledger and verdict log cover the same readings");

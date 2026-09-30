@@ -15,5 +15,10 @@ public enum RejectReason {
     /** 传感器已被故障隔离，不再受理其读数。 */
     SENSOR_ISOLATED,
     /** 采样动作在有界重试后仍失败（设备瞬时/持续故障）。 */
-    ACQUISITION_FAILED
+    ACQUISITION_FAILED,
+    /**
+     * 关闭边界的未完成：读数已提交（已入队），但关闭排空超时、消费者卡住等原因使其
+     * 在进程停止前没有得到接受/拒绝裁决。与普通拒绝分列，绝不静默丢失。
+     */
+    SHUTDOWN_INCOMPLETE
 }

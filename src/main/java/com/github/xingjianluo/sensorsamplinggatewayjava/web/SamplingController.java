@@ -9,6 +9,7 @@ import com.github.xingjianluo.sensorsamplinggatewayjava.reconcile.Reconciliation
 import com.github.xingjianluo.sensorsamplinggatewayjava.reconcile.ReconciliationStoreStats;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
@@ -45,6 +46,24 @@ public class SamplingController {
     @GetMapping("/stats")
     public GatewayStats stats() {
         return lifecycle.gateway().stats();
+    }
+
+    /**
+     * 运行中切换规则版本（不重启、不开新批次）：切换前已受理读数按原版本完成，
+     * 切换后新读数按新版本判定；同代次内可按 rulesVersion 切片核对，总账仍闭合。
+     * 仅切换规则版本标签（校准/量程等规则内容不变，便于本地演示）。
+     */
+    @PostMapping("/rules-version")
+    public Map<String, Object> switchRulesVersion(@RequestParam String rulesVersion) {
+        var gw = lifecycle.gateway();
+        long generationBefore = gw.reconciliation().runningGeneration();
+        gw.switchRulesVersion(rulesVersion);
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("switched", true);
+        out.put("rulesVersion", gw.config().rulesVersion());
+        out.put("generation", generationBefore);
+        out.put("sameGeneration", generationBefore == gw.reconciliation().runningGeneration());
+        return out;
     }
 
     @GetMapping("/verdicts")

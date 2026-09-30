@@ -6,6 +6,7 @@ import com.github.xingjianluo.sensorsamplinggatewayjava.model.Verdict;
 import org.junit.jupiter.api.Test;
 
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
@@ -15,7 +16,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 
-/** 对账台账单元测试：闭合口径、按代次/传感器/规则版本/时间切片、有界保留与封代清除。 */
+/** 对账台账单元测试：四类闭合、按代次/传感器/规则版本/时间切片、同代多版本阶段、有界保留与封代清除。 */
 class ReconciliationStoreTest {
 
     private static RawReading reading(String sensor, long tick) {
@@ -31,23 +32,48 @@ class ReconciliationStoreTest {
     }
 
     private void assertClosed(ReconciliationReport r) {
-        assertEquals(r.total(), r.accepted() + r.rejected(), "total = accepted + rejected");
+        // 四类终结方式互斥且穷尽
+        assertEquals(r.total(),
+                r.accepted() + r.rejected() + r.evictedOld() + r.incomplete(),
+                "total = accepted + rejected + evictedOld + incomplete");
         long byReason = r.rejectedByReason().values().stream().mapToLong(Long::longValue).sum();
         assertEquals(r.rejected(), byReason, "rejected = sum(byReason)");
         long overflow = r.rejectedByReason().getOrDefault(RejectReason.BUFFER_OVERFLOW, 0L);
-        assertEquals(r.evictedOld() + r.rejectedNew(), overflow,
-                "BUFFER_OVERFLOW = evictedOld + rejectedNew");
+        assertEquals(r.rejectedNew(), overflow,
+                "BUFFER_OVERFLOW = rejectedNew only (evictions stay out of rejected)");
+        assertEquals(r.backpressure(), r.evictedOld() + r.rejectedNew(), "backpressure split");
+        assertEquals(r.accepted() + r.rejected() + r.evictedOld() + r.incomplete(),
+                r.acceptedEntries().size() + r.rejectedEntries().size()
+                        + r.evictedEntries().size() + r.incompleteEntries().size()
+                        + (r.complete() ? 0 : r.detailRollover()),
+                "retained details + rollover cover total");
         assertTrue(r.acceptedEntries().size() <= r.accepted(), "accepted detail is subset");
         assertTrue(r.rejectedEntries().size() <= r.rejected(), "rejected detail is subset");
+        assertTrue(r.evictedEntries().size() <= r.evictedOld(), "evicted detail is subset");
+        assertTrue(r.incompleteEntries().size() <= r.incomplete(), "incomplete detail is subset");
         if (r.complete()) {
             assertEquals(r.accepted(), r.acceptedEntries().size(), "complete: accepted list matches count");
             assertEquals(r.rejected(), r.rejectedEntries().size(), "complete: rejected list matches count");
+            assertEquals(r.evictedOld(), r.evictedEntries().size(), "complete: evicted list matches count");
+            assertEquals(r.incomplete(), r.incompleteEntries().size(), "complete: incomplete list matches count");
         }
         Set<String> keys = new HashSet<>();
-        r.acceptedEntries().forEach(e -> assertTrue(keys.add(e.generation() + "#" + e.sensorTickKey()),
-                "unique accepted key"));
-        r.rejectedEntries().forEach(e -> assertTrue(keys.add(e.generation() + "#" + e.sensorTickKey()),
-                "unique rejected key"));
+        r.acceptedEntries().forEach(e -> {
+            assertEquals(Disposition.ACCEPTED, e.disposition());
+            assertTrue(keys.add(e.generation() + "#" + e.sensorTickKey()), "unique accepted key");
+        });
+        r.rejectedEntries().forEach(e -> {
+            assertEquals(Disposition.REJECTED, e.disposition());
+            assertTrue(keys.add(e.generation() + "#" + e.sensorTickKey()), "unique rejected key");
+        });
+        r.evictedEntries().forEach(e -> {
+            assertEquals(Disposition.EVICTED_OLD, e.disposition());
+            assertTrue(keys.add(e.generation() + "#" + e.sensorTickKey()), "unique evicted key");
+        });
+        r.incompleteEntries().forEach(e -> {
+            assertEquals(Disposition.INCOMPLETE, e.disposition());
+            assertTrue(keys.add(e.generation() + "#" + e.sensorTickKey()), "unique incomplete key");
+        });
     }
 
     @Test
@@ -66,34 +92,36 @@ class ReconciliationStoreTest {
                 BackpressureKind.EVICTED_OLD, 1006L);
         store.append(reject("a", 7, "rules-v1", RejectReason.SENSOR_ISOLATED), BackpressureKind.NONE, 1007L);
         store.append(reject("a", 8, "rules-v1", RejectReason.ACQUISITION_FAILED), BackpressureKind.NONE, 1008L);
-        store.sealGeneration(1009L);
+        store.appendIncomplete("rules-v1", reading("a", 9), 1009L);
+        store.sealGeneration(1010L);
 
         ReconciliationReport r = store.reconcile(ReconciliationFilter.forGeneration(g));
         assertClosed(r);
-        assertTrue(r.complete(), "no rollover -> complete");
-        assertEquals(9, r.total());
+        assertFalse(r.complete(), "incomplete readings make the report explicitly incomplete");
+        assertEquals(10, r.total());
         assertEquals(2, r.accepted());
-        assertEquals(7, r.rejected());
+        assertEquals(6, r.rejected(), "evicted and incomplete stay out of rejected");
         assertEquals(1, r.rejectedNew());
         assertEquals(1, r.evictedOld());
+        assertEquals(1, r.incomplete());
         Map<RejectReason, Long> br = r.rejectedByReason();
         assertEquals(1L, br.get(RejectReason.OUT_OF_RANGE));
         assertEquals(1L, br.get(RejectReason.TIMESTAMP_ANOMALY));
         assertEquals(1L, br.get(RejectReason.DATA_CORRUPT));
-        assertEquals(2L, br.get(RejectReason.BUFFER_OVERFLOW));
+        assertEquals(1L, br.get(RejectReason.BUFFER_OVERFLOW), "only direct rejection counts in reason");
         assertEquals(1L, br.get(RejectReason.SENSOR_ISOLATED));
         assertEquals(1L, br.get(RejectReason.ACQUISITION_FAILED));
+        assertEquals(0L, br.getOrDefault(RejectReason.SHUTDOWN_INCOMPLETE, 0L),
+                "incomplete is a separate bucket, not counted in rejectedByReason");
 
         GenerationInfo info = store.generation(g);
         assertTrue(info.sealed());
-        assertEquals(9, info.total());
+        assertEquals(10, info.total());
         assertEquals(2, info.backpressure());
-        Set<RejectReason> seenReasons = new HashSet<>();
-        r.rejectedEntries().forEach(e -> {
-            assertNotNull(e.reason());
-            seenReasons.add(e.reason());
-        });
-        assertEquals(6, seenReasons.size(), "all reject reasons present in detail");
+        assertEquals(1, info.incomplete());
+        assertEquals(List.of("rules-v1"), info.rulesVersions());
+        assertEquals(1, r.incompleteEntries().size());
+        assertEquals(9L, r.incompleteEntries().get(0).tick());
     }
 
     @Test
@@ -134,6 +162,45 @@ class ReconciliationStoreTest {
 
         assertNotNull(store.findEntry(g1, "a#0"));
         assertNotNull(store.findEntry(g2, "a#0"));
+    }
+
+    @Test
+    void midRunRulesSwitch_sameGeneration_twoVersionPhasesEachSliceableAndTotalClosed() {
+        ReconciliationStore store = new ReconciliationStore(64, 4, RetentionPolicy.ROLL_OLDEST);
+        long g = store.beginGeneration("rules-v1", 0L);
+        store.append(accept("a", 0, "rules-v1"), BackpressureKind.NONE, 1L);
+        store.append(accept("a", 1, "rules-v1"), BackpressureKind.NONE, 2L);
+        // 运行中切换：不开新代，登记新阶段
+        store.noteRulesVersion("rules-v2");
+        long stillSame = store.runningGeneration();
+        assertEquals(g, stillSame, "hot switch keeps the same generation");
+        store.append(accept("a", 2, "rules-v2"), BackpressureKind.NONE, 3L);
+        store.append(reject("a", 3, "rules-v2", RejectReason.OUT_OF_RANGE), BackpressureKind.NONE, 4L);
+
+        GenerationInfo info = store.generation(g);
+        assertEquals(List.of("rules-v1", "rules-v2"), info.rulesVersions());
+        assertEquals("rules-v2", info.rulesVersion());
+
+        ReconciliationReport v1 = store.reconcile(ReconciliationFilter.forRulesVersion("rules-v1"));
+        assertClosed(v1);
+        assertEquals(2, v1.total());
+        assertEquals(2, v1.accepted());
+
+        ReconciliationReport v2 = store.reconcile(ReconciliationFilter.forRulesVersion("rules-v2"));
+        assertClosed(v2);
+        assertEquals(2, v2.total());
+        assertEquals(1, v2.accepted());
+        assertEquals(1, v2.rejected());
+
+        ReconciliationReport whole = store.reconcile(ReconciliationFilter.forGeneration(g));
+        assertClosed(whole);
+        assertTrue(whole.complete());
+        assertEquals(4, whole.total(), "single run total stays closed across phases");
+        // 版本 + 传感器组合切片
+        ReconciliationReport aV2 = store.reconcile(
+                new ReconciliationFilter(g, "a", "rules-v2", 0L, 0L));
+        assertClosed(aV2);
+        assertEquals(2, aV2.total());
     }
 
     @Test
@@ -224,10 +291,27 @@ class ReconciliationStoreTest {
     void appendWithoutRunningGeneration_isDeterministicallyIgnored() {
         ReconciliationStore store = new ReconciliationStore(64, 2, RetentionPolicy.ROLL_OLDEST);
         assertNull(store.append(accept("a", 0, "rules-v1"), BackpressureKind.NONE, 0L));
-        assertEquals(1L, store.storeStats().appendsWhileNoRunningGen());
+        assertNull(store.appendIncomplete("rules-v1", reading("a", 1), 0L));
+        assertEquals(2L, store.storeStats().appendsWhileNoRunningGen());
         ReconciliationReport r = store.reconcile(ReconciliationFilter.all());
         assertClosed(r);
         assertEquals(0, r.total());
+    }
+
+    @Test
+    void duplicateKeyAppendedTwice_isIdempotentlyIgnored() {
+        ReconciliationStore store = new ReconciliationStore(64, 2, RetentionPolicy.ROLL_OLDEST);
+        store.beginGeneration("rules-v1", 0L);
+        assertNotNull(store.append(accept("a", 0, "rules-v1"), BackpressureKind.NONE, 0L));
+        // 故障恢复/关闭竞争下同一身份键再次落账：不重复计数
+        assertNull(store.append(accept("a", 0, "rules-v1"), BackpressureKind.NONE, 1L));
+        assertNull(store.appendIncomplete("rules-v1", reading("a", 0), 2L));
+        assertEquals(2L, store.storeStats().duplicateAppendsIgnored());
+        ReconciliationReport r = store.reconcile(ReconciliationFilter.all());
+        assertClosed(r);
+        assertEquals(1, r.total());
+        assertEquals(1, r.accepted());
+        assertEquals(0, r.incomplete(), "already-verdicted reading is not re-booked incomplete");
     }
 
     @Test

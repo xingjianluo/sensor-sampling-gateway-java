@@ -110,14 +110,16 @@ class ConcurrentSamplingIntegrationTest {
         GatewayStats s = gw.stats();
         assertNoDuplicateKeys(gw.verdictLog().recent());
         // 容量为1 + DROP_OLDEST + 高速生产者：应观测到驱逐
-        assertTrue(s.dropped() > 0, "expected DROP_OLDEST evictions under pressure");
-        long overflowCount = s.rejectedByReason().getOrDefault(RejectReason.BUFFER_OVERFLOW, 0L);
-        assertTrue(overflowCount > 0, "evicted oldest form BUFFER_OVERFLOW verdicts");
-        // 正确不变量（每个 sensor#tick 恰一条结论）：submitted = accepted + rejected，
-        // 且背压 dropped = byReason[BUFFER_OVERFLOW]（驱逐 + 直接拒绝）
-        assertEquals(s.submitted(), s.accepted() + s.rejected(),
-                "submitted must equal accepted + rejected");
-        assertEquals(s.dropped(), overflowCount, "dropped equals BUFFER_OVERFLOW rejections");
+        assertTrue(s.evictedOld() > 0, "expected DROP_OLDEST evictions under pressure");
+        // 老口径保持：被顶掉只计背压（dropped 的一部分），不抬高 rejected/byReason
+        assertEquals(s.dropped(), s.evictedOld() + s.rejectedNew());
+        assertEquals(0L, s.rejectedNew(), "no direct newest rejection on pure DROP_OLDEST run");
+        assertEquals(0L, s.rejectedByReason().getOrDefault(RejectReason.BUFFER_OVERFLOW, 0L),
+                "evictions must not inflate BUFFER_OVERFLOW reason count");
+        // 总闭合（每个 sensor#tick 恰一条终结）：submitted = accepted + rejected + evictedOld + incomplete
+        assertEquals(s.submitted(),
+                s.accepted() + s.rejected() + s.evictedOld() + s.shutdownIncomplete(),
+                "submitted must equal accepted + rejected + evictedOld + shutdownIncomplete");
         logSummary("DROP_OLDEST", gw);
     }
 
@@ -146,6 +148,8 @@ class ConcurrentSamplingIntegrationTest {
         assertTrue(overflow > 0, "capacity-1 DROP_NEWEST must reject newest under pressure");
         assertEquals(s.submitted(), s.enqueued() + s.rejected());
         assertEquals(s.dropped(), overflow, "DROP_NEWEST drops are all recorded as BUFFER_OVERFLOW");
+        assertEquals(s.dropped(), s.rejectedNew(), "direct drops recorded in rejectedNew backpressure");
+        assertEquals(0L, s.evictedOld(), "no eviction on DROP_NEWEST path");
         logSummary("DROP_NEWEST", gw);
     }
 
@@ -271,7 +275,10 @@ class ConcurrentSamplingIntegrationTest {
         LOG.info(() -> "[" + scenario + "] submitted=" + s.submitted()
                 + " enqueued=" + s.enqueued() + " consumed=" + s.consumed()
                 + " accepted=" + s.accepted() + " rejected=" + s.rejected()
-                + " dropped=" + s.dropped() + " acquisitionFailures=" + s.acquisitionFailures()
+                + " dropped=" + s.dropped() + " (evictedOld=" + s.evictedOld()
+                + ", rejectedNew=" + s.rejectedNew() + ")"
+                + " shutdownIncomplete=" + s.shutdownIncomplete()
+                + " acquisitionFailures=" + s.acquisitionFailures()
                 + " byReason=" + s.rejectedByReason()
                 + " isolated=" + s.isolatedSensors());
     }
